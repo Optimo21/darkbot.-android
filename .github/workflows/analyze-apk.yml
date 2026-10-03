@@ -4,10 +4,13 @@ on:
   push:
     paths:
       - '.github/workflows/analyze-apk.yml'
+  issues:
+    types: [opened]
   workflow_dispatch:
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   patch:
@@ -34,7 +37,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openjdk-17-jre-headless unzip zip p7zip-full ripgrep python3 apksigner zipalign
           curl -L --fail --retry 5 --retry-all-errors             -o apktool.jar             https://github.com/iBotPeaches/Apktool/releases/latest/download/apktool.jar
-          java -version
           java -jar apktool.jar --version
 
       - name: Decode APK
@@ -66,106 +68,62 @@ jobs:
               r'is[_$]?banned|is[_$]?blocked|over[_$]?limit|'
               r'quota[_$]?exceeded|limit[_$]?reached|trial[_$]?expired'
               r')([^a-z0-9]|$)', re.I)
-
           SIGNAL_POS = re.compile(
               r'whitelist|allowlist|authorized|authorization|premium|vip|'
-              r'entitlement|unlimited|licensed|trial|access', re.I)
+              r'entitlement|unlimited|licensed|eligible|access', re.I)
           SIGNAL_NEG = re.compile(
               r'limit|quota|restricted|denied|banned|blocked|trial', re.I)
 
-          method_start = re.compile(r'^\.method\b')
-          method_end = re.compile(r'^\.end method\s*$')
-
-          patched = []
-          candidates = []
+          patched, candidates = [], []
+          ms = re.compile(r'^\.method\b')
+          me = re.compile(r'^\.end method\s*$')
 
           for path in pathlib.Path('decoded').glob('smali*/**/*.smali'):
-              text = path.read_text('utf-8', errors='ignore')
-              lines = text.splitlines()
-              out = []
-              i = 0
-              changed = False
+              lines = path.read_text('utf-8', errors='ignore').splitlines()
+              out, i, changed = [], 0, False
               while i < len(lines):
-                  if not method_start.match(lines[i]):
+                  if not ms.match(lines[i]):
                       out.append(lines[i]); i += 1; continue
-
-                  start = i
                   j = i + 1
-                  while j < len(lines) and not method_end.match(lines[j]):
+                  while j < len(lines) and not me.match(lines[j]):
                       j += 1
                   if j >= len(lines):
-                      out.extend(lines[start:]); break
-
-                  block = lines[start:j+1]
+                      out.extend(lines[i:]); break
+                  block = lines[i:j+1]
                   header = block[0]
-                  is_bool = bool(re.search(r'\)Z(?:\s|$)', header))
-                  is_native_or_abstract = bool(re.search(r'\b(native|abstract)\b', header))
-                  if not is_bool or is_native_or_abstract:
+                  if not re.search(r'\)Z(?:\s|$)', header) or re.search(r'\b(native|abstract)\b', header):
                       out.extend(block); i = j + 1; continue
-
-                  sig = header
+                  nm = re.search(r'\s([^\s(]+)\([^)]*\)Z', header)
+                  name = nm.group(1) if nm else header
                   body = '\n'.join(block)
-                  m = re.search(r'\s([^\s(]+)\([^)]*\)Z', header)
-                  name = m.group(1) if m else header
-
-                  score = 0
-                  desired = None
-
-                  if POSITIVE.search(name):
-                      score += 8
-                      desired = True
-                  if NEGATIVE.search(name):
-                      score += 10
-                      desired = False
-
+                  score, desired = 0, None
+                  if POSITIVE.search(name): score, desired = score + 8, True
+                  if NEGATIVE.search(name): score, desired = score + 10, False
                   if SIGNAL_POS.search(body):
                       score += 3
-                      if desired is None:
-                          desired = True
+                      if desired is None: desired = True
                   if SIGNAL_NEG.search(body):
                       score += 2
-                      if desired is None and ('limit' in body.lower() or 'quota' in body.lower() or 'denied' in body.lower()):
+                      if desired is None and any(x in body.lower() for x in ('limit','quota','denied')):
                           desired = False
-
-                  # Avoid touching generic accessors unless there is strong lexical evidence.
                   if score >= 8 and desired is not None:
-                      candidates.append({
-                          "file": str(path),
-                          "method": name,
-                          "desired": desired,
-                          "score": score,
-                          "header": header
-                      })
-                      indent = '    '
-                      const = '0x1' if desired else '0x0'
-                      replacement = [
-                          header,
-                          f'{indent}.locals 1',
-                          f'{indent}const/4 v0, {const}',
-                          f'{indent}return v0',
-                          '.end method'
-                      ]
-                      out.extend(replacement)
+                      candidates.append({"file":str(path),"method":name,"desired":desired,"score":score})
+                      out += [header, '    .locals 1',
+                              f'    const/4 v0, {"0x1" if desired else "0x0"}',
+                              '    return v0', '.end method']
                       changed = True
                   else:
                       out.extend(block)
                   i = j + 1
-
               if changed:
-                  path.write_text('\n'.join(out) + '\n', encoding='utf-8')
+                  path.write_text('\n'.join(out)+'\n', encoding='utf-8')
                   patched.append(str(path))
 
-          report = {
-              "patched_files": patched,
-              "patched_methods": candidates,
-              "patched_count": len(candidates),
-          }
+          report = {"patched_files":patched,"patched_methods":candidates,"patched_count":len(candidates)}
           pathlib.Path('patch-report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
           print(json.dumps(report, indent=2))
-
           if not candidates:
-              print("NO_STRONG_BOOLEAN_GATE_FOUND")
-              raise SystemExit(42)
+              raise SystemExit("No strong boolean access/limit gate found")
           PY
           python3 patch_smali.py
 
@@ -180,11 +138,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          keytool -genkeypair -v             -keystore patch-release.keystore             -storepass changeit             -keypass changeit             -alias darkbot             -keyalg RSA -keysize 2048             -validity 10000             -dname "CN=Optimo21 Darkbot Patch, O=Optimo21"
+          keytool -genkeypair -v             -keystore patch-release.keystore             -storepass changeit -keypass changeit             -alias darkbot -keyalg RSA -keysize 2048             -validity 10000             -dname "CN=Optimo21 Darkbot Patch, O=Optimo21"
           apksigner sign             --ks patch-release.keystore             --ks-pass pass:changeit             --key-pass pass:changeit             --out darkorbit-v0.1.1-unlimited.apk             patched-aligned.apk
           apksigner verify --verbose darkorbit-v0.1.1-unlimited.apk
-          sha256sum darkorbit-v0.1.1-unlimited.apk | tee patched-sha256.txt
-          stat -c%s darkorbit-v0.1.1-unlimited.apk | tee patched-size.txt
+          sha256sum darkorbit-v0.1.1-unlimited.apk > patched-sha256.txt
+          stat -c%s darkorbit-v0.1.1-unlimited.apk > patched-size.txt
 
       - name: Publish patched APK as GitHub Release
         env:
@@ -194,7 +152,36 @@ jobs:
           set -euo pipefail
           tag="01-unlimited"
           gh release delete "$tag" --yes 2>/dev/null || true
-          gh release create "$tag"             --title "v0.1.1 — Unlimited access"             --notes "Best-effort patch of the owner-provided APK. Access/limit boolean gates were patched to remove the identified restriction. Re-signed by this workflow; the original signing key is not available in this environment."             darkorbit-v0.1.1-unlimited.apk             patched-sha256.txt             patch-report.json
+          gh release create "$tag"             --title "v0.1.1 — Unlimited access"             --notes "Best-effort owner-authorized patch of the provided APK. Access/limit boolean gates were patched based on the decompiled code. This build is newly signed; the original signing key is not available here."             darkorbit-v0.1.1-unlimited.apk             patched-sha256.txt             patch-report.json
+
+      - name: Persist analysis report
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "# APK patch report"
+            echo
+            cat patch-report.json
+            echo
+            echo "SHA-256:"
+            cat patched-sha256.txt
+            echo
+            echo "Size:"
+            cat patched-size.txt
+          } > analysis-report.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analysis-report.md
+          git commit -m "Add APK patch report" || true
+          git push origin HEAD:main || true
+
+      - name: Close trigger issue
+        if: ${{ github.event_name == 'issues' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh issue close "${{ github.event.issue.number }}" --reason completed || true
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -205,4 +192,5 @@ jobs:
             darkorbit-v0.1.1-unlimited.apk
             patched-sha256.txt
             patch-report.json
+            analysis-report.md
           retention-days: 14
