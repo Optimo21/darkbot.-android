@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   analyze:
@@ -15,8 +15,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Download release APK
+      - name: Download and verify release APK
         shell: bash
         run: |
           set -euo pipefail
@@ -25,39 +27,25 @@ jobs:
           echo "Downloaded $(stat -c%s darkorbit.apk) bytes"
           echo "68b917db3c6fa2d21d21b801fdf32f64d03de81c9faa782512e0abf4641bde4c  darkorbit.apk" | sha256sum -c -
 
-      - name: Install Android reverse-engineering tools
+      - name: Install APK tools
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y apktool unzip zip p7zip-full ripgrep python3-pip
-          python3 -m pip install --user androguard
+          sudo apt-get install -y apktool ripgrep unzip zip p7zip-full
 
-      - name: Decode APK
+      - name: Inventory and decode
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p raw-strings
+          unzip -Z1 darkorbit.apk > apk-files.txt
+          for dex in $(unzip -Z1 darkorbit.apk | grep -E '^classes([0-9]+)?\.dex$' || true); do
+            unzip -p darkorbit.apk "$dex" | strings -n 4 > "raw-strings/$dex.txt" || true
+          done
           apktool d --force --no-res darkorbit.apk -o decoded
-          find decoded/smali* -type f -name '*.smali' | wc -l | tee smali-count.txt
-          find decoded -maxdepth 2 -type f | sort > decoded-files.txt
 
-      - name: Search access/limit checks
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "=== APK metadata ==="
-            unzip -p darkorbit.apk AndroidManifest.xml 2>/dev/null | strings | head -n 200 || true
-            echo
-            echo "=== Keyword matches in decoded smali/resources ==="
-            rg -n -i --hidden --glob '!*.png' --glob '!*.jpg' --glob '!*.webp'               'limit|capped|cap|premium|vip|whitelist|allowlist|authorized|authoriz|trial|license|subscription|entitlement|restricted|access|free|unlimited|max.?users|max.?time|quota|permission' decoded               > keyword-matches.txt || true
-            echo "=== Candidate conditionals ==="
-            rg -n -i 'if-(eq|ne|lt|le|gt|ge).*\b(vip|premium|license|authorized|whitelist|trial|limit|quota|entitlement)\b|return-boolean' decoded/smali*               > conditional-candidates.txt || true
-            echo "=== String inventory (selected) ==="
-            rg -n -i 'limit|premium|vip|whitelist|authorized|trial|license|subscription|restricted|unlimited|quota|entitlement' decoded/res decoded/smali*               > selected-strings.txt || true
-          } | tee analysis-summary.txt
-
-      - name: Package a compact analysis report
+      - name: Locate access and limit logic
         shell: bash
         run: |
           set -euo pipefail
@@ -65,21 +53,36 @@ jobs:
             echo "APK size: $(stat -c%s darkorbit.apk)"
             echo "APK SHA-256: $(sha256sum darkorbit.apk | cut -d' ' -f1)"
             echo
-            echo "Smali file count: $(cat smali-count.txt)"
+            echo "DEX files:"
+            cat apk-files.txt | grep -E '^classes([0-9]+)?\.dex$' || true
             echo
-            echo "Top keyword matches:"
-            head -n 400 keyword-matches.txt || true
+            echo "Likely access/limit strings:"
+            rg -n -i 'whitelist|allowlist|authorized|authorization|premium|vip|license|entitlement|subscription|trial|quota|limit|unlimited|max.?users|max.?time|restricted|access denied|not authorized|permission' raw-strings decoded/smali* decoded/res 2>/dev/null | head -n 2500 || true
             echo
-            echo "Conditional candidates:"
-            head -n 400 conditional-candidates.txt || true
+            echo "Likely boolean gate methods:"
+            rg -n -i '^\.method.*\b(is|has|can|check|allow|authorize|verify|validate|access|premium|vip|limit|quota|entitlement|licensed|whitelist|trial)' decoded/smali* 2>/dev/null | head -n 2000 || true
             echo
-            echo "Selected strings:"
-            head -n 400 selected-strings.txt || true
+            echo "Likely hard-coded limits:"
+            rg -n -i 'const(-wide)?/.*[0-9]+|const/4.*0x[0-9a-f]+|const/16.*0x[0-9a-f]+' decoded/smali* 2>/dev/null | head -n 2000 || true
+            echo
+            echo "Native libraries:"
+            find decoded/lib -type f -maxdepth 3 2>/dev/null | sort || true
           } > analysis-report.txt
-          tar -czf apk-analysis-report.tgz analysis-report.txt keyword-matches.txt conditional-candidates.txt selected-strings.txt smali-count.txt decoded-files.txt
-      - name: Upload analysis report
+
+      - name: Commit report back to repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp analysis-report.txt "/tmp/analysis-report.txt"
+          git add -f analysis-report.txt
+          git commit -m "Add generated APK analysis report" || exit 0
+          git push origin HEAD:main
+
+      - name: Upload report artifact
         uses: actions/upload-artifact@v4
         with:
           name: apk-analysis-report
-          path: apk-analysis-report.tgz
+          path: analysis-report.txt
           retention-days: 7
